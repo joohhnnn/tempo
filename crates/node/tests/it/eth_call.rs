@@ -586,6 +586,87 @@ async fn test_eth_estimate_gas_preseeded_zero_address_validator_token() -> eyre:
     Ok(())
 }
 
+/// `eth_estimateGas` must succeed for native transfers with `maxFeePerGas`.
+/// Foundry's `cast send` fills `maxFeePerGas` before estimating gas.
+#[test_case(ForkSchedule::Devnet ; "devnet")]
+#[test_case(ForkSchedule::Testnet ; "testnet")]
+#[test_case(ForkSchedule::Mainnet ; "mainnet")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_eth_estimate_gas_native_transfer_with_max_fee(
+    schedule: ForkSchedule,
+) -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let setup = TestNodeBuilder::new()
+        .with_schedule(schedule)
+        .build_http_only()
+        .await?;
+    let http_url = setup.http_url;
+
+    let wallet = MnemonicBuilder::from_phrase(crate::utils::TEST_MNEMONIC).build()?;
+    let caller = wallet.address();
+    let provider = ProviderBuilder::new().wallet(wallet).connect_http(http_url);
+
+    // Fund the account: create a test token, mint, and do a transaction to bump nonce > 0
+    let token = setup_test_token(provider.clone(), caller).await?;
+    token
+        .mint(caller, U256::from(1_000_000))
+        .gas(1_000_000)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+
+    let recipient = Address::random();
+
+    // Case 1: Native transfer WITHOUT maxFeePerGas — should succeed
+    let tx_no_fee = TransactionRequest::default()
+        .from(caller)
+        .to(recipient)
+        .value(U256::ZERO);
+    let gas_no_fee = provider.estimate_gas(tx_no_fee).await?;
+    assert!(
+        gas_no_fee > 0,
+        "native transfer without maxFeePerGas should succeed"
+    );
+
+    // Case 2: Native transfer WITH maxFeePerGas — this is the bug
+    let tx_with_fee = TransactionRequest::default()
+        .from(caller)
+        .to(recipient)
+        .value(U256::ZERO)
+        .max_fee_per_gas(TEMPO_T1_BASE_FEE as u128 * 2);
+    let gas_with_fee = provider.estimate_gas(tx_with_fee).await?;
+    assert!(
+        gas_with_fee > 0,
+        "native transfer with maxFeePerGas should succeed, got gas_limit=0"
+    );
+
+    // Both should return the same gas estimate
+    assert_eq!(
+        gas_no_fee, gas_with_fee,
+        "gas estimate should not depend on whether maxFeePerGas is set"
+    );
+
+    // Case 3: Contract call WITH maxFeePerGas — should succeed (control case)
+    let calldata = token
+        .transfer(recipient, U256::from(100))
+        .calldata()
+        .clone();
+    let tx_contract = TransactionRequest::default()
+        .from(caller)
+        .to(*token.address())
+        .input(TransactionInput::new(calldata))
+        .max_fee_per_gas(TEMPO_T1_BASE_FEE as u128 * 2);
+    let gas_contract = provider.estimate_gas(tx_contract).await?;
+    assert!(
+        gas_contract > 0,
+        "contract call with maxFeePerGas should succeed"
+    );
+
+    Ok(())
+}
+
 #[test_case(ForkSchedule::Devnet ; "devnet")]
 #[test_case(ForkSchedule::Testnet ; "testnet")]
 #[test_case(ForkSchedule::Mainnet ; "mainnet")]

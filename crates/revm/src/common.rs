@@ -804,4 +804,105 @@ mod tests {
 
         Ok(())
     }
+
+    /// Mirrors the `caller_gas_allowance` calculation from `crates/node/src/rpc/mod.rs`.
+    fn calc_gas_allowance(fee_token_balance: U256, gas_price: u128) -> u64 {
+        if fee_token_balance.is_zero() {
+            return u64::MAX;
+        }
+        fee_token_balance
+            .saturating_mul(tempo_primitives::transaction::TEMPO_GAS_PRICE_SCALING_FACTOR)
+            .checked_div(U256::from(gas_price))
+            .unwrap_or_default()
+            .saturating_to()
+    }
+
+    fn make_tx(caller: Address, to: Address, gas_price: u128, data: Bytes) -> TempoTxEnv {
+        TempoTxEnv {
+            inner: TxEnv {
+                caller,
+                kind: TxKind::Call(to),
+                data,
+                gas_price,
+                gas_limit: 30_000_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Native transfer and contract call should resolve fee token and compute the same
+    /// gas allowance when backed by the same balance.
+    #[test]
+    fn test_caller_gas_allowance_native_transfer_with_fee() -> eyre::Result<()> {
+        let sender = Address::random();
+        let recipient = Address::random();
+        let gas_price: u128 = 20_000_000_000; // 20 gwei
+        let balance = U256::from(1_490_000u64); // ~1.49 USDC
+
+        let mut db = revm::database::CacheDB::new(EmptyDB::default());
+        let balance_slot = TIP20Token::from_address(PATH_USD_ADDRESS)?.balances[sender].slot();
+        db.insert_account_storage(PATH_USD_ADDRESS, balance_slot, balance)?;
+
+        // Native transfer (empty data, to=EOA) — fee token falls back to PathUSD
+        let tx = make_tx(sender, recipient, gas_price, Bytes::new());
+        let fee_token = db.get_fee_token(&tx, sender, TempoHardfork::Genesis)?;
+        assert_eq!(fee_token, DEFAULT_FEE_TOKEN);
+
+        let fee_balance = db.get_token_balance(fee_token, sender, TempoHardfork::Genesis)?;
+        let allowance = calc_gas_allowance(fee_balance, gas_price);
+        // (1_490_000 * 10^12) / 20_000_000_000 = 74_500_000
+        assert_eq!(allowance, 74_500_000);
+
+        // Contract call (transfer calldata, to=TIP20) — fee token inferred from calldata
+        let tip20 = address!("0x20C0000000000000000000000000000000000001");
+        let tip20_slot = TIP20Token::from_address(tip20)?.balances[sender].slot();
+        db.insert_account_storage(tip20, tip20_slot, balance)?;
+        db.insert_account_storage(
+            tip20,
+            tip20_slots::CURRENCY,
+            uint!(0x5553440000000000000000000000000000000000000000000000000000000006_U256),
+        )?;
+
+        let calldata = transferCall {
+            to: recipient,
+            amount: U256::from(1000),
+        }
+        .abi_encode();
+        let tx2 = make_tx(sender, tip20, gas_price, calldata.into());
+        let fee_token2 = db.get_fee_token(&tx2, sender, TempoHardfork::Genesis)?;
+        let fee_balance2 = db.get_token_balance(fee_token2, sender, TempoHardfork::Genesis)?;
+
+        assert_eq!(
+            calc_gas_allowance(fee_balance, gas_price),
+            calc_gas_allowance(fee_balance2, gas_price),
+            "same balance + gas price should give same allowance"
+        );
+
+        Ok(())
+    }
+
+    /// When the resolved fee token has zero balance (e.g. user holds a non-PathUSD token),
+    /// gas allowance must be u64::MAX so estimation is not capped to 0.
+    #[test]
+    fn test_caller_gas_allowance_zero_balance_not_capped() -> eyre::Result<()> {
+        let sender = Address::random();
+        let gas_price: u128 = 20_000_000_000;
+
+        // User holds USDC in a different token; PathUSD balance is 0.
+        let other_usdc = address!("0x20C000000000000000000000b9537d11c60e8b50");
+        let mut db = revm::database::CacheDB::new(EmptyDB::default());
+        let slot = TIP20Token::from_address(other_usdc)?.balances[sender].slot();
+        db.insert_account_storage(other_usdc, slot, U256::from(1_490_000u64))?;
+
+        let tx = make_tx(sender, Address::random(), gas_price, Bytes::new());
+        let fee_token = db.get_fee_token(&tx, sender, TempoHardfork::Genesis)?;
+        assert_eq!(fee_token, DEFAULT_FEE_TOKEN);
+
+        let fee_balance = db.get_token_balance(fee_token, sender, TempoHardfork::Genesis)?;
+        assert!(fee_balance.is_zero());
+        assert_eq!(calc_gas_allowance(fee_balance, gas_price), u64::MAX);
+
+        Ok(())
+    }
 }

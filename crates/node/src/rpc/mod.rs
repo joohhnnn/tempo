@@ -273,6 +273,9 @@ impl<N: FullNodeTypes<Types = TempoNode>> Call for TempoEthApi<N> {
     }
 
     /// Returns the max gas limit that the caller can afford given a transaction environment.
+    ///
+    /// Uses fee token balance (not native ETH balance) to calculate the gas allowance,
+    /// since Tempo transactions pay gas fees with TIP-20 tokens.
     fn caller_gas_allowance(
         &self,
         mut db: impl Database<Error: Into<EthApiError>>,
@@ -289,6 +292,14 @@ impl<N: FullNodeTypes<Types = TempoNode>> Call for TempoEthApi<N> {
         let fee_token_balance = db
             .get_token_balance(fee_token, fee_payer, evm_env.cfg_env.spec)
             .map_err(ProviderError::other)?;
+
+        // If fee token balance is zero, don't cap the gas limit. This allows gas
+        // estimation to return meaningful results even when the account is unfunded or
+        // the balance read fails (e.g. fee token resolution returns a token with no
+        // balance). The actual balance check still happens during EVM execution.
+        if fee_token_balance.is_zero() {
+            return Ok(u64::MAX);
+        }
 
         Ok(fee_token_balance
             // multiply by the scaling factor
